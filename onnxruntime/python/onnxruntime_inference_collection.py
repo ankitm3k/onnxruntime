@@ -1320,6 +1320,43 @@ class OrtValue:
         return cls(C.OrtValue.ortvalue_from_numpy_with_onnx_type(data, onnx_element_type), data)
 
     @classmethod
+    def ortvalue_from_cpu_memory(
+        cls, data: np.ndarray, /, ep_device: C.OrtEpDevice, shape: Sequence[int], element_type
+    ) -> OrtValue:
+        """
+        Creates an OrtValue directly on top of a numpy array's buffer, importing it for use
+        by the given OrtEpDevice. No data copy is made: the returned OrtValue holds a reference
+        to `data` and aliases its buffer. `data` must be C-contiguous and writable, and must not
+        be resized while the OrtValue is alive - holding a reference prevents the array from
+        being freed, but not from reallocating its buffer in place.
+
+        If ep_device targets CPU, the memory is simply wrapped, same as ortvalue_from_numpy.
+        For any other device, the OrtValue is created via the target EP's external memory
+        importer (see OrtInteropApi in the C API); this raises if the EP does not support
+        importing CPU_VA memory. Everything needed to keep the import valid - the importer and
+        the imported memory handle - is owned by the returned OrtValue and released with it.
+
+        :param data: numpy.ndarray whose buffer backs the returned OrtValue. Must be C-contiguous
+            and writable.
+        :param ep_device: the OrtEpDevice to import the memory into.
+        :param shape: List of integers indicating the shape of the OrtValue.
+        :param element_type: The data type of the elements. It can be either numpy type (like
+            numpy.float32) or an integer for onnx type (like onnx.TensorProto.BFLOAT16).
+        """
+        # Hold a reference to the numpy object as the OrtValue is backed directly by its data
+        # buffer, so the numpy object must be around until this OrtValue instance is around.
+        if isinstance(element_type, int):
+            return cls(
+                C.OrtValue.ortvalue_from_cpu_memory_with_onnx_type(data, ep_device, shape, element_type),
+                data,
+            )
+
+        return cls(
+            C.OrtValue.ortvalue_from_cpu_memory(data, ep_device, shape, element_type),
+            data,
+        )
+
+    @classmethod
     def ortvalue_from_shape_and_type(
         cls,
         shape: Sequence[int],
