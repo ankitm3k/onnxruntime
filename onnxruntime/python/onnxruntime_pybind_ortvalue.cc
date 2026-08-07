@@ -9,10 +9,15 @@
 #define PY_ARRAY_UNIQUE_SYMBOL onnxruntime_python_ARRAY_API
 #include "python/numpy_helper.h"
 
+#include <functional>
+#include <memory>
+#include <utility>
+
 #include "core/framework/ort_value.h"
 #include "core/framework/tensor.h"
 #include "core/framework/sparse_tensor.h"
 #include "core/framework/TensorSeq.h"
+#include "core/framework/tensorprotoutils.h"
 namespace onnxruntime {
 namespace python {
 
@@ -100,6 +105,199 @@ std::unique_ptr<OrtValue> OrtValueFromShapeAndTypeWithMemoryInfo(const std::vect
   auto ml_value = std::make_unique<OrtValue>();
   Tensor::InitOrtValue(element_type, gsl::make_span(shape), std::move(allocator), *ml_value);
   return ml_value;
+}
+
+// Resolves a Python-supplied numpy element type (e.g. numpy.float32) to the corresponding
+// MLDataType, rejecting anything that is not a numeric numpy type.
+MLDataType NumpyElementTypeToMLDataType(const py::object& numpy_element_type) {
+  PyArray_Descr* dtype;
+  if (!PyArray_DescrConverter(numpy_element_type.ptr(), &dtype)) {
+    throw std::runtime_error("Not a valid numpy type");
+  }
+
+  const int type_num = dtype->type_num;
+  Py_DECREF(dtype);
+
+  if (!IsNumericNumpyType(type_num)) {
+    throw std::runtime_error("Creation of OrtValues is currently only supported from non-string numpy arrays");
+  }
+
+  return NumpyTypeToOnnxRuntimeTensorType(type_num);
+}
+
+// Resolves a Python-supplied ONNX element type enum value to the corresponding MLDataType.
+MLDataType OnnxElementTypeToMLDataType(int32_t onnx_element_type) {
+  if (!ONNX_NAMESPACE::TensorProto_DataType_IsValid(onnx_element_type)) {
+    ORT_THROW("Not a valid ONNX Tensor data type: ", onnx_element_type);
+  }
+
+  if (onnx_element_type == onnx::TensorProto_DataType::TensorProto_DataType_STRING) {
+    throw std::runtime_error("Creation of OrtValues is currently only supported from non-string numpy arrays");
+  }
+
+  return OnnxTypeToOnnxRuntimeTensorType(onnx_element_type);
+}
+
+// Deleters for the C API objects involved in an external memory import. Each holds the OrtInteropApi
+// pointer so that releasing never has to call Ort::GetInteropApi() (which can throw) from a destructor.
+struct ExternalResourceImporterDeleter {
+  const OrtInteropApi* interop_api;
+  void operator()(OrtExternalResourceImporter* p) const noexcept {
+    interop_api->ReleaseExternalResourceImporter(p);
+  }
+};
+
+struct ExternalMemoryHandleDeleter {
+  const OrtInteropApi* interop_api;
+  void operator()(OrtExternalMemoryHandle* p) const noexcept {
+    interop_api->ReleaseExternalMemoryHandle(p);
+  }
+};
+
+struct CApiOrtValueDeleter {
+  void operator()(OrtValue* p) const noexcept {
+    Ort::GetApi().ReleaseValue(p);
+  }
+};
+
+// Owns every resource that an imported tensor is a view over.
+//
+// A tensor produced by OrtInteropApi::CreateTensorFromMemory does not copy data and does not own the
+// memory handle it was created from - the C API requires the handle (and, for most EPs, the importer
+// that produced it) to outlive the tensor. Bundling all three here and destroying them together lets
+// callers treat the resulting OrtValue as an ordinary self-contained value.
+//
+// Members are destroyed in reverse declaration order: the EP's OrtValue first, then the memory
+// handle, then the importer. Do not reorder.
+struct ImportedExternalMemory {
+  std::unique_ptr<OrtExternalResourceImporter, ExternalResourceImporterDeleter> importer;
+  std::unique_ptr<OrtExternalMemoryHandle, ExternalMemoryHandleDeleter> mem_handle;
+  std::unique_ptr<OrtValue, CApiOrtValueDeleter> ep_tensor;
+};
+
+// Wraps the EP-created tensor in an OrtValue whose deleter keeps `imported` alive, so that releasing
+// the returned OrtValue tears the import down in the correct order no matter when or where it happens.
+std::unique_ptr<OrtValue> OrtValueOwningImportedMemory(ImportedExternalMemory imported) {
+  auto owner = std::make_shared<ImportedExternalMemory>(std::move(imported));
+
+  if (!owner->ep_tensor->IsTensor()) {
+    ORT_THROW("CreateTensorFromMemory did not return a tensor.");
+  }
+
+  auto* tensor = owner->ep_tensor->GetMutable<Tensor>();
+
+  auto ort_value = std::make_unique<OrtValue>();
+  // The deleter does nothing but hold the last reference to `owner`; dropping it releases the tensor,
+  // then the memory handle, then the importer.
+  ort_value->Init(tensor, DataTypeImpl::GetType<Tensor>(),
+                  std::function<void(void*)>([owner](void*) {}));
+  return ort_value;
+}
+
+// The tensor is a dense view over info.ptr, so a strided or transposed buffer would be silently
+// misinterpreted rather than rejected. Require C-contiguous layout.
+void EnsureCContiguous(const py::buffer_info& info) {
+  if (info.size == 0) {
+    // Strides are unconstrained when there are no elements to address.
+    return;
+  }
+
+  py::ssize_t expected_stride = info.itemsize;
+  for (py::ssize_t i = info.ndim - 1; i >= 0; --i) {
+    // A dimension of extent 1 is never indexed, so its stride carries no meaning.
+    if (info.shape[i] != 1) {
+      if (info.strides[i] != expected_stride) {
+        ORT_THROW(
+            "The supplied buffer is not C-contiguous. Pass a contiguous array "
+            "(e.g. numpy.ascontiguousarray(a)) - note that this makes a copy, which the "
+            "resulting OrtValue will alias instead of the original array.");
+      }
+      expected_stride *= info.shape[i];
+    }
+  }
+}
+
+// Creates an OrtValue directly on top of externally-owned host memory (e.g. a numpy array's
+// buffer), importing it for use by the given OrtEpDevice. No data copy is made.
+//
+// If ep_device targets CPU, CreateTensorWithDataAsOrtValue-equivalent wrapping is used directly -
+// no importer is required or involved, since a CPU VA is already exactly what CPU tensor creation
+// wants. For any other device, the generic OrtInteropApi external-memory-import path is used with
+// ORT_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION; this will fail with ORT_NOT_IMPLEMENTED unless the
+// target EP's OrtExternalResourceImporterImpl supports importing CPU_VA memory.
+std::unique_ptr<OrtValue> OrtValueFromCpuMemory(py::buffer& data, const OrtEpDevice& ep_device,
+                                                const std::vector<int64_t>& shape,
+                                                MLDataType element_type) {
+  // Request writable access: the resulting OrtValue is a mutable tensor that may be bound as a model
+  // output, so a read-only buffer has to be rejected here rather than written through later.
+  py::buffer_info info = data.request(/*writable=*/true);
+  EnsureCContiguous(info);
+
+  const TensorShape tensor_shape(shape);
+
+  // The tensor aliases the buffer, so the buffer must be able to back every element it describes.
+  const size_t buffer_bytes = narrow<size_t>(info.size) * narrow<size_t>(info.itemsize);
+  const size_t required_bytes = narrow<size_t>(tensor_shape.Size()) * element_type->Size();
+  if (required_bytes > buffer_bytes) {
+    ORT_THROW("Shape and element type require ", required_bytes, " bytes, but the supplied buffer holds only ",
+              buffer_bytes, " bytes.");
+  }
+
+  Ort::ConstEpDevice const_ep_device(&ep_device);
+  if (const_ep_device.Device().Type() == OrtHardwareDeviceType_CPU) {
+    Ort::ConstMemoryInfo mem_info = const_ep_device.GetMemoryInfo(OrtDeviceMemoryType_DEFAULT);
+    const OrtMemoryInfo* cpu_memory_info = static_cast<const OrtMemoryInfo*>(mem_info);
+    if (cpu_memory_info == nullptr) {
+      // EpDevice_MemoryInfo returning nullptr for DEFAULT memory type means "EP uses CPU memory".
+      cpu_memory_info = &GetAllocator()->Info();
+    }
+
+    auto ort_value = std::make_unique<OrtValue>();
+    Tensor::InitOrtValue(element_type, tensor_shape, info.ptr, *cpu_memory_info, *ort_value);
+    return ort_value;
+  }
+
+  const auto& interop_api = Ort::GetInteropApi();
+
+  OrtExternalResourceImporter* importer = nullptr;
+  Ort::ThrowOnError(interop_api.CreateExternalResourceImporterForDevice(&ep_device, &importer));
+  if (importer == nullptr) {
+    ORT_THROW(
+        "The execution provider for the given OrtEpDevice does not support external resource import.");
+  }
+  ImportedExternalMemory imported{{importer, ExternalResourceImporterDeleter{&interop_api}}, {}, {}};
+
+  bool can_import = false;
+  Ort::ThrowOnError(
+      interop_api.CanImportMemory(importer, ORT_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION, &can_import));
+  if (!can_import) {
+    ORT_THROW(
+        "The execution provider for the given OrtEpDevice does not support importing CPU virtual address memory.");
+  }
+
+  OrtExternalMemoryDescriptor mem_desc{};
+  mem_desc.version = ORT_API_VERSION;
+  mem_desc.handle_type = ORT_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION;
+  mem_desc.native_handle = info.ptr;
+  mem_desc.size_bytes = buffer_bytes;
+
+  OrtExternalMemoryHandle* mem_handle = nullptr;
+  Ort::ThrowOnError(interop_api.ImportMemory(importer, &mem_desc, &mem_handle));
+  imported.mem_handle = {mem_handle, ExternalMemoryHandleDeleter{&interop_api}};
+
+  OrtExternalTensorDescriptor tensor_desc{};
+  tensor_desc.version = ORT_API_VERSION;
+  tensor_desc.element_type = utils::CApiElementTypeFromProtoType(element_type->AsPrimitiveDataType()->GetDataType());
+  tensor_desc.shape = shape.data();
+  tensor_desc.rank = shape.size();
+
+  OrtValue* tensor = nullptr;
+  Ort::ThrowOnError(interop_api.CreateTensorFromMemory(importer, mem_handle, &tensor_desc, &tensor));
+  imported.ep_tensor.reset(tensor);
+
+  // The returned OrtValue owns the import chain, so the caller does not have to keep the importer or
+  // the memory handle alive - only the source buffer.
+  return OrtValueOwningImportedMemory(std::move(imported));
 }
 
 }  // namespace
@@ -298,24 +496,17 @@ void addOrtValueMethods(pybind11::module& m) {
                              const_cast<void*>(data.data()), cpu_allocator->Info(), *ort_value);
         return ort_value;
       })
+      // Creates an OrtValue on top of externally-owned host memory (e.g. a numpy array's buffer),
+      // importing it for use by the given OrtEpDevice. No data copy is made, so the returned OrtValue
+      // aliases `data` and keep_alive<0, 1> pins `data` for as long as it lives. Note that a reference
+      // does not prevent in-place reallocation: the caller must not resize the source buffer.
+      .def_static("ortvalue_from_cpu_memory", [](py::buffer& data, const OrtEpDevice& ep_device, const std::vector<int64_t>& shape, py::object& numpy_element_type) -> std::unique_ptr<OrtValue> { return OrtValueFromCpuMemory(data, ep_device, shape, NumpyElementTypeToMLDataType(numpy_element_type)); }, py::keep_alive<0, 1>())
+      // Same as ortvalue_from_cpu_memory, but takes an onnx element type integer instead of a numpy
+      // type. This is helpful for data types (like TensorProto.BFLOAT16) not available in numpy.
+      .def_static("ortvalue_from_cpu_memory_with_onnx_type", [](py::buffer& data, const OrtEpDevice& ep_device, const std::vector<int64_t>& shape, int32_t onnx_element_type) -> std::unique_ptr<OrtValue> { return OrtValueFromCpuMemory(data, ep_device, shape, OnnxElementTypeToMLDataType(onnx_element_type)); }, py::keep_alive<0, 1>())
       // Factory method to create an OrtValue from the given shape and numpy element type on the specified device.
       // The memory is left uninitialized
-      .def_static("ortvalue_from_shape_and_type", [](const std::vector<int64_t>& shape, py::object& numpy_element_type, const OrtDevice& device) -> std::unique_ptr<OrtValue> {
-        PyArray_Descr* dtype;
-        if (!PyArray_DescrConverter(numpy_element_type.ptr(), &dtype)) {
-          throw std::runtime_error("Not a valid numpy type");
-        }
-
-        int type_num = dtype->type_num;
-        Py_DECREF(dtype);
-
-        if (!IsNumericNumpyType(type_num)) {
-          throw std::runtime_error("Creation of OrtValues is currently only supported from non-string numpy arrays");
-        }
-
-        auto element_type = NumpyTypeToOnnxRuntimeTensorType(type_num);
-        return OrtValueFromShapeAndType(shape, element_type, device);
-      })
+      .def_static("ortvalue_from_shape_and_type", [](const std::vector<int64_t>& shape, py::object& numpy_element_type, const OrtDevice& device) -> std::unique_ptr<OrtValue> { return OrtValueFromShapeAndType(shape, NumpyElementTypeToMLDataType(numpy_element_type), device); })
       // Factory method to create an OrtValue from the given shape and onnx element type on the specified device.
       // The memory is left uninitialized
       .def_static("ortvalue_from_shape_and_onnx_type", [](const std::vector<int64_t>& shape, int32_t onnx_element_type, const OrtDevice& device) -> std::unique_ptr<OrtValue> {
@@ -324,46 +515,27 @@ void addOrtValueMethods(pybind11::module& m) {
         }
 
         auto element_type = OnnxTypeToOnnxRuntimeTensorType(onnx_element_type);
-        return OrtValueFromShapeAndType(shape, element_type, device);
-      })
+        return OrtValueFromShapeAndType(shape, element_type, device); })
       // Factory methods to create an OrtValue using an OrtMemoryInfo to select the allocator.
       // This enables allocation with a specific memory type (e.g. HOST_ACCESSIBLE) from plugin EPs.
-      .def_static("ortvalue_from_shape_and_type_for_memory_info", [](const std::vector<int64_t>& shape, py::object& numpy_element_type, const OrtMemoryInfo& memory_info) -> std::unique_ptr<OrtValue> {
-        PyArray_Descr* dtype;
-        if (!PyArray_DescrConverter(numpy_element_type.ptr(), &dtype)) {
-          throw std::runtime_error("Not a valid numpy type");
-        }
-
-        int type_num = dtype->type_num;
-        Py_DECREF(dtype);
-
-        if (!IsNumericNumpyType(type_num)) {
-          throw std::runtime_error("Creation of OrtValues is currently only supported from non-string numpy arrays");
-        }
-
-        auto element_type = NumpyTypeToOnnxRuntimeTensorType(type_num);
-        return OrtValueFromShapeAndTypeWithMemoryInfo(shape, element_type, memory_info);
-      })
+      .def_static("ortvalue_from_shape_and_type_for_memory_info", [](const std::vector<int64_t>& shape, py::object& numpy_element_type, const OrtMemoryInfo& memory_info) -> std::unique_ptr<OrtValue> { return OrtValueFromShapeAndTypeWithMemoryInfo(shape, NumpyElementTypeToMLDataType(numpy_element_type),
+                                                                                                                                                                                                                                                       memory_info); })
       .def_static("ortvalue_from_shape_and_onnx_type_for_memory_info", [](const std::vector<int64_t>& shape, int32_t onnx_element_type, const OrtMemoryInfo& memory_info) -> std::unique_ptr<OrtValue> {
         if (onnx_element_type == onnx::TensorProto_DataType::TensorProto_DataType_STRING) {
           throw std::runtime_error("Creation of OrtValues is currently only supported from non-string numpy arrays");
         }
 
         auto element_type = OnnxTypeToOnnxRuntimeTensorType(onnx_element_type);
-        return OrtValueFromShapeAndTypeWithMemoryInfo(shape, element_type, memory_info);
-      })
+        return OrtValueFromShapeAndTypeWithMemoryInfo(shape, element_type, memory_info); })
 
 #if !defined(DISABLE_SPARSE_TENSORS)
-      .def_static("ort_value_from_sparse_tensor", [](const PySparseTensor* py_sparse_tensor) -> std::unique_ptr<OrtValue> {
-        return py_sparse_tensor->AsOrtValue();
-      })
+      .def_static("ort_value_from_sparse_tensor", [](const PySparseTensor* py_sparse_tensor) -> std::unique_ptr<OrtValue> { return py_sparse_tensor->AsOrtValue(); })
       // This will create a copy of OrtValue(cheap) and will return as a separate SparseTensor object
       .def("as_sparse_tensor", [](const OrtValue* ort_value) -> std::unique_ptr<PySparseTensor> {
         if (!ort_value->IsSparseTensor()) {
           ORT_THROW("This OrtValue does not contain SparseTensor. Check data_type() value.");
         }
-        return std::make_unique<PySparseTensor>(*ort_value);
-      })
+        return std::make_unique<PySparseTensor>(*ort_value); })
 #endif
       // Get a pointer to Tensor data
       .def("data_ptr", [](OrtValue* ml_value) -> uintptr_t {
@@ -377,8 +549,7 @@ void addOrtValueMethods(pybind11::module& m) {
         }
 
         // Should cover x86 and x64 platforms
-        return reinterpret_cast<uintptr_t>(tensor->MutableDataRaw());
-      })
+        return reinterpret_cast<uintptr_t>(tensor->MutableDataRaw()); })
       .def("device_name", [](const OrtValue* ort_value) -> std::string {
         if (ort_value->IsTensor()) {
           if (IsWebGpuBuffer(*ort_value)) {
@@ -417,8 +588,7 @@ void addOrtValueMethods(pybind11::module& m) {
           shape_arr.append(dim);
         }
 
-        return shape_arr;
-      })
+        return shape_arr; })
       .def("data_type", [](const OrtValue* ort_value) -> std::string {
         const ONNX_NAMESPACE::TypeProto* type_proto;
         // Handle gutless types first to get the actual type
@@ -440,8 +610,7 @@ void addOrtValueMethods(pybind11::module& m) {
 
         ORT_ENFORCE(type_proto != nullptr, "Unknown type of OrtValue: ", ort_value->Type());
 
-        return *ONNX_NAMESPACE::Utils::DataTypeUtils::ToType(*type_proto);
-      })
+        return *ONNX_NAMESPACE::Utils::DataTypeUtils::ToType(*type_proto); })
       .def("element_type", [](const OrtValue* ort_value) -> int32_t { return GetTensorProtoType(*ort_value); },
            "Returns an integer equal to the ONNX tensor proto type of the tensor or sequence. "
            "This integer is one type defined by ONNX TensorProto_DataType "
