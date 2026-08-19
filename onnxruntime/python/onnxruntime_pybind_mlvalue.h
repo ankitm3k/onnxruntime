@@ -136,7 +136,8 @@ void CreateGenericMLValue(const onnxruntime::InputDefList* input_def_list, const
 pybind11::object GetPyObjFromTensor(const OrtValue& rtensor,
                                     const DataTransferManager* data_transfer_manager = nullptr,
                                     const std::unordered_map<OrtDevice, MemCpyFunc>* mem_cpy_to_host_functions = nullptr,
-                                    bool zero_copy_non_owning = false);
+                                    bool zero_copy_non_owning = false,
+                                    pybind11::handle numpy_owner = {});
 
 // Update the tensor data in an OrtValue in-place from another OrtValue.
 // Both OrtValues must contain tensors of the same data type and size.
@@ -158,13 +159,15 @@ pybind11::array StringTensorToNumpyArray(const Tensor& tensor);
 
 /// <summary>
 /// Creates a numpy array with shape over OrtValue memory. Numpy array
-/// does not own the memory, but it holds a copy or OrtValue in a py::capsule.
-/// OrtValue is destroyed when the numpy array is garbage collected.
+/// does not own the memory. If numpy_owner is provided, numpy holds it as the
+/// base object. Otherwise, a native OrtValue copy in a capsule owns the memory.
 /// This is used when the OrtValue memory is on CPU.
 /// </summary>
 /// <param name="ort_value">OrtValue with data</param>
+/// <param name="numpy_owner">Optional Python object that owns ort_value</param>
 /// <returns>numpy array</returns>
-pybind11::array PrimitiveTensorToNumpyOverOrtValue(const OrtValue& ort_value);
+pybind11::array PrimitiveTensorToNumpyOverOrtValue(const OrtValue& ort_value,
+                                                   pybind11::handle numpy_owner = {});
 
 /// <summary>
 /// Creates a numpy array with shape with a copy of OrtValue data.
