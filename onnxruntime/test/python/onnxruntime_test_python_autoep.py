@@ -379,6 +379,7 @@ class TestAutoEP(AutoEpTestCase):
         result = ort_value.numpy()
         self.assertEqual(result.shape, (3, 2))
         self.assertEqual(result.dtype, np.float32)
+        self.assertIs(result.base, ort_value._get_c_value())
 
         # Objects that may reference EP library functions must be released before
         # unloading the library.
@@ -406,13 +407,19 @@ class TestAutoEP(AutoEpTestCase):
         mem_info = ep_device.memory_info(onnxrt.OrtDeviceMemoryType.HOST_ACCESSIBLE)
 
         ort_value = onnxrt.OrtValue.ortvalue_from_shape_and_type([2, 3], np.float32, memory_info=mem_info)
-        ort_value.numpy().fill(7.5)
-        np.testing.assert_array_equal(ort_value.numpy(), np.full((2, 3), 7.5, dtype=np.float32))
+        ep_view = ort_value.numpy()
+        ep_view.fill(7.5)
+        self.assertIs(ep_view.base, ort_value._get_c_value())
+        np.testing.assert_array_equal(ep_view, np.full((2, 3), 7.5, dtype=np.float32))
 
         cpu_value = onnxrt.OrtValue.ortvalue_from_shape_and_type([2, 3], np.float32)
-        cpu_value.numpy().fill(-1.25)
-        np.testing.assert_array_equal(cpu_value.numpy(), np.full((2, 3), -1.25, dtype=np.float32))
+        cpu_view = cpu_value.numpy()
+        cpu_view.fill(-1.25)
+        self.assertIs(cpu_view.base, cpu_value._get_c_value())
+        np.testing.assert_array_equal(cpu_view, np.full((2, 3), -1.25, dtype=np.float32))
 
+        del ep_view
+        del cpu_view
         del ort_value
         del cpu_value
         self.unregister_execution_provider_library(self.EXAMPLE_EP_NAME)

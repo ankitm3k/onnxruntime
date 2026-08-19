@@ -410,25 +410,22 @@ py::array StringTensorToNumpyArray(const Tensor& tensor) {
   return result;
 }
 
-pybind11::array PrimitiveTensorToNumpyOverOrtValue(const OrtValue& ort_value) {
+pybind11::array PrimitiveTensorToNumpyOverOrtValue(const OrtValue& ort_value, py::handle numpy_owner) {
   const Tensor& tensor = ort_value.Get<Tensor>();
-  // The capsule destructor must be stateless
-  // We create a copy of OrtValue on the heap.
-  auto memory_release = [](void* data) {
-    auto* ort_value = reinterpret_cast<OrtValue*>(data);
-    delete ort_value;
-  };
-
   const int numpy_type = OnnxRuntimeTensorToNumpyType(tensor.DataType());
+
+  if (numpy_owner) {
+    return py::array(py::dtype(numpy_type), tensor.Shape().GetDims(), tensor.DataRaw(), numpy_owner);
+  }
+
   auto ort_value_ptr = std::make_unique<OrtValue>(ort_value);
-  pybind11::capsule caps(ort_value_ptr.get(), memory_release);
+  py::capsule capsule(ort_value_ptr.get(), [](void* data) {
+    delete reinterpret_cast<OrtValue*>(data);
+  });
   ort_value_ptr.release();
 
   // Not using array_t<T> because it may not handle MLFloat16 properly
-  pybind11::array result(py::dtype(numpy_type), tensor.Shape().GetDims(),
-                         tensor.DataRaw(),
-                         caps);
-  return result;
+  return py::array(py::dtype(numpy_type), tensor.Shape().GetDims(), tensor.DataRaw(), capsule);
 }
 
 pybind11::array PrimitiveTensorToNumpyFromDevice(const OrtValue& ort_value, const DataTransferAlternative& dtm) {
@@ -453,7 +450,8 @@ pybind11::array PrimitiveTensorToNumpyFromDevice(const OrtValue& ort_value, cons
 py::object GetPyObjFromTensor(const OrtValue& ort_value,
                               const DataTransferManager* data_transfer_manager,
                               const std::unordered_map<OrtDevice, MemCpyFunc>* mem_cpy_to_host_functions,
-                              bool zero_copy_non_owning) {
+                              bool zero_copy_non_owning,
+                              py::handle numpy_owner) {
   ORT_ENFORCE(ort_value.IsTensor(), "This function only supports tensors");
 
   const auto& tensor = ort_value.Get<Tensor>();
@@ -473,7 +471,7 @@ py::object GetPyObjFromTensor(const OrtValue& ort_value,
   // dangling pointer. See https://github.com/microsoft/onnxruntime/issues/21922
   if (device.UsesCpuMemory()) {
     if (tensor.OwnsBuffer() || zero_copy_non_owning) {
-      py::array result = PrimitiveTensorToNumpyOverOrtValue(ort_value);
+      py::array result = PrimitiveTensorToNumpyOverOrtValue(ort_value, numpy_owner);
       return py::cast<py::object>(result);
     }
     // Tensor does not own the buffer — must copy to avoid dangling pointers
