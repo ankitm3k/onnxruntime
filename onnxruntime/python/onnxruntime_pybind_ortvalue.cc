@@ -625,7 +625,8 @@ void addOrtValueMethods(pybind11::module& m) {
       .def("is_tensor_sequence", [](const OrtValue* ort_value) -> bool { return ort_value->IsTensorSequence(); })
       .def("_is_webgpu_buffer", [](const OrtValue* ort_value) -> bool { return IsWebGpuBuffer(*ort_value); })
       // Converts Tensor into a numpy array
-      .def("numpy", [](const OrtValue* ml_value) -> py::object {
+      .def("numpy", [](py::object self) -> py::object {
+        const auto* ml_value = self.cast<const OrtValue*>();
         ORT_ENFORCE(ml_value->IsTensor(), "Only OrtValues that are Tensors are convertible to Numpy objects");
         [[maybe_unused]] const auto& device = ml_value->Get<Tensor>().Location().device;
 #ifdef _MSC_VER
@@ -640,26 +641,26 @@ void addOrtValueMethods(pybind11::module& m) {
           case OrtDevice::VendorIds::NVIDIA:
             if (TryGetProviderInfo_CUDA() == nullptr) {
               return GetPyObjFromTensor(*ml_value, nullptr, nullptr,
-                                        /*zero_copy_non_owning=*/true);
+                                        /*zero_copy_non_owning=*/true, self);
             }
             return GetPyObjFromTensor(*ml_value, nullptr, GetCudaToHostMemCpyFunction(device),
-                                      /*zero_copy_non_owning=*/true);
+                                      /*zero_copy_non_owning=*/true, self);
 #endif
 #ifdef USE_CANN
           case OrtDevice::VendorIds::HUAWEI:
             return GetPyObjFromTensor(*ml_value, nullptr, GetCannToHostMemCpyFunction(),
-                                      /*zero_copy_non_owning=*/true);
+                                      /*zero_copy_non_owning=*/true, self);
 #endif
 
 #ifdef USE_DML
           case OrtDevice::VendorIds::MICROSOFT:
             return GetPyObjFromTensor(*ml_value, nullptr, GetDmlToHostMemCpyFunction(device),
-                                      /*zero_copy_non_owning=*/true);
+                                      /*zero_copy_non_owning=*/true, self);
 #endif
 #ifdef USE_MIGRAPHX
           case OrtDevice::VendorIds::AMD:
             return GetPyObjFromTensor(*ml_value, nullptr, GetMIGraphXToHostMemCpyFunction(device),
-                                      /*zero_copy_non_owning=*/true);
+                                      /*zero_copy_non_owning=*/true, self);
 #endif
           default:
             // OrtValue.numpy() is called by the user who explicitly holds the OrtValue
@@ -667,7 +668,7 @@ void addOrtValueMethods(pybind11::module& m) {
             // zero_copy_non_owning=true is safe here (and required to preserve the
             // zero-copy semantics that OrtValue.numpy() / __array__ rely on).
             return GetPyObjFromTensor(*ml_value, nullptr, nullptr,
-                                      /*zero_copy_non_owning=*/true);
+                                      /*zero_copy_non_owning=*/true, self);
         }
 #ifdef _MSC_VER
 #pragma warning(pop)
